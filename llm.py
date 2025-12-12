@@ -40,6 +40,22 @@ class OpenRouterModels(Enum):
     SONNET35 = "anthropic/claude-3.5-sonnet:beta"
     LLAMA3_70B = "meta-llama/llama-3-70b-instruct"
     DEEPSEEKCODER = "deepseek/deepseek-coder"
+    LLAMA31_8B = "meta-llama/llama-3.1-8b-instruct"
+    LLAMA33_70B = "meta-llama/llama-3.3-70b-instruct"
+    QWEN25_CODER_32B = "qwen/qwen-2.5-coder-32b-instruct"
+    QWEN25_72B = "qwen/qwen-2.5-72b-instruct"
+    QWEN25_32B = "Qwen/Qwen2.5-32B-Instruct"  # siliconflow
+    QWEN3_8B = "qwen/qwen3-8b"
+    QWEN3_32B = "qwen/qwen3-32b"
+    DEEPSEEK_V31 = "deepseek/deepseek-v3.1-terminus"
+    DEEPSEEK_V32_EXP = "deepseek/deepseek-v3.2-exp"
+    KIMI_K2_0905 = "moonshotai/kimi-k2-0905"
+    GLM_45 = "z-ai/glm-4.5"
+    GLM_46 = "z-ai/glm-4.6"
+    GPT_4O = "openai/gpt-4o"
+    GPT_5_CHAT = "openai/gpt-5-chat"
+    GEMINI_25_PRO = "google/gemini-2.5-pro"
+    GEMINI_3_PRO_PREVIEW = "google/gemini-3-pro-preview"
 
 class LLMClient:
     AVAILABLE_MODELS = {
@@ -68,7 +84,7 @@ class LLMClient:
         self.provider = provider
         self.api_key = key or self._get_api_key()
         assert self.api_key is not None, f"API key not found for provider {self.provider}"
-        self.system_content = system_content if system_content is not None else "You will be provided a few code examples on color grid input generator and transformation. You will be creative and come up with similar and interesting problems."
+        self.system_content = system_content #if system_content is not None else "You will be provided a few code examples on color grid input generator and transformation. You will be creative and come up with similar and interesting problems."
         self.client = self._initialize_client()
         self.cache = dc.Cache(cache_dir)
         self.usage_cache = dc.Cache(cache_dir + "_usage")
@@ -163,18 +179,14 @@ class LLMClient:
         return self.usage_cache.get(model, {"input_tokens": 0, "output_tokens": 0})
 
     def send_request(self, prompt, model, temperature, max_tokens, top_p, num_samples):
+        messages = []
+        if self.system_content is not None:
+            messages.append({"role": "system", "content": self.system_content})
+        messages.append({"role": "user", "content": prompt})
+        
         response = self.client.chat.completions.create(
             model=model.value,
-            messages=[
-                {
-                    "role": "system",
-                    "content": self.system_content
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
+            messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
             top_p=top_p,
@@ -309,7 +321,9 @@ class LLMClient:
         cache_key = self._hash_embedding(input, model.value)
         self.cache[cache_key] = embedding
 
-    def generate(self, prompt, num_samples, model=None, temperature=0.7, max_tokens=800, top_p=1, ignore_cache_samples=False):
+    def generate(self, prompt, num_samples, model=None, temperature=0.7, max_tokens=800, top_p=1, ignore_cache_samples=False,
+                 result=None):
+        if result is not None: prompt, model = result.prompt, result.model
         model = self.check_model_name(model)
         if not ignore_cache_samples:
             cached_samples = self.get_samples_from_cache(prompt, model, temperature, max_tokens, top_p)
@@ -325,7 +339,7 @@ class LLMClient:
                     response = self.send_request(prompt, model, temperature, max_tokens, top_p, remaining_samples)
                     new_samples = [c.message.content for c in response.choices]
                     self.add_samples_to_cache(prompt, model, temperature, max_tokens, top_p, new_samples)
-                    self.update_usage(model.value, response.usage)
+                    # self.update_usage(model.value, response.usage)
                     actually_got_samples = True
                 except Exception as e:
                     if "Rate limit reached for model" in str(e):
@@ -339,12 +353,23 @@ class LLMClient:
                         print("Bad Request, skipping")
                         print(e)
                         break
+                    elif "User not found" in str(e):
+                        print("Wrong api key, skipping")
+                        print(e)
+                        break
+                    elif "region" in str(e):
+                        print("Country, region, or territory not supported, skipping")
+                        print(e)
+                        break
                     else:
-                        print("Error, going to try again in 1 second", e)
+                        print("Error, going to try again in 1 second", model.value,e)
                         time.sleep(1)
 
         # WARN neccessary to get the samples from cache again as it might have been updated
         cached_samples = self.get_samples_from_cache(prompt, model, temperature, max_tokens, top_p)
+        if result is not None:
+            result.response = cached_samples[0]
+            return result
 
         # Return a subset of the cached samples if they are more than the requested number
         if len(cached_samples) > num_samples:
@@ -400,10 +425,12 @@ class LLMClient:
 
 
 
-    def generate_parallel(self, prompts, num_samples, model=None, temperature=0.7, max_tokens=800, top_p=1, num_workers=8):
+    def generate_parallel(self, prompts=None, num_samples=1, model=None, temperature=0.7, max_tokens=800, top_p=1, num_workers=8,
+                          results=None):
         """use concurrent futures to generate samples in parallel"""
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = [executor.submit(self.generate, prompt, num_samples, model, temperature, max_tokens, top_p) for prompt in prompts]
+            futures = [executor.submit(self.generate, prompt, num_samples, model, temperature, max_tokens, top_p) for prompt in prompts] \
+                if results is None else [executor.submit(self.generate, None, num_samples, None, temperature, max_tokens, top_p, result=result) for result in results]
             results = []
             for future in tqdm(as_completed(futures), total=len(futures), desc="Generating samples"):
                 results.append(future.result())

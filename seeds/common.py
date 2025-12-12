@@ -8,7 +8,7 @@ class Color:
     """
     Enum for colors
 
-    Color.BLACK, Color.BLUE, Color.RED, Color.GREEN, Color.YELLOW, Color.GREY, Color.PINK, Color.ORANGE, Color.TEAL, Color.MAROON
+    Color.BLACK, Color.BLUE, Color.RED, Color.GREEN, Color.YELLOW, Color.GREY, Color.PINK, Color.ORANGE, Color.TEAL, Color.MAROON, Color.WHITE
 
     Use Color.ALL_COLORS for `set` of all possible colors
     Use Color.NOT_BLACK for `set` of all colors except black
@@ -29,6 +29,7 @@ class Color:
     ORANGE = 7
     TEAL = 8
     MAROON = 9
+    WHITE = 10
     TRANSPARENT = 0 # sometimes the language model likes to pretend that there is something called transparent/background, and black is a reasonable default
     BACKGROUND = 0
 
@@ -1064,10 +1065,12 @@ def _score_symmetry(grid, symmetry, ignore_colors, background=None):
 
     return perfect_mapping, off_canvas, bad_mapping
 
-def show_colored_grid(grid, text=True):
+def show_colored_grid(grid, text=True, show_tick_labels=False, ax=None):
     """
     internal function not used by LLM
     Not used by the language model, used by the rest of the code for debugging
+
+    ax: optional Matplotlib Axes. If provided, draw into this axes without creating/showing a new figure.
     """
 
     if not text:
@@ -1086,26 +1089,36 @@ def show_colored_grid(grid, text=True):
             7: (0xFF, 0x85, 0x1B),
             8: (0x7F, 0xDB, 0xFF),
             9: (0x87, 0x0C, 0x25),
+            10: (0xFF, 0xFF, 0xFF),
         }
 
         _float_colors = [tuple(c / 255 for c in col) for col in colors_rgb.values()]
         arc_cmap = ListedColormap(_float_colors)
         grid = grid.T
-        plt.figure()
-        plot_handle = plt.gca()
+        # Use provided axes if available; otherwise create a new one and show it.
+        if ax is None:
+            plt.figure()
+            plot_handle = plt.gca()
+        else:
+            plot_handle = ax
         plot_handle.pcolormesh(
             grid,
             cmap=arc_cmap,
             rasterized=True,
             vmin=0,
-            vmax=9,
+            vmax=max(colors_rgb.keys()),
         )
         plot_handle.set_xticks(np.arange(0, grid.shape[1], 1))
         plot_handle.set_yticks(np.arange(0, grid.shape[0], 1))
+        if not show_tick_labels:
+            plot_handle.tick_params(axis='both', which='both', length=0)
+            plot_handle.set_xticklabels([])
+            plot_handle.set_yticklabels([])
         plot_handle.grid()
         plot_handle.set_aspect(1)
         plot_handle.invert_yaxis()
-        plt.show()
+        if ax is None:
+            plt.show()
         return
 
     color_names = [
@@ -1119,6 +1132,7 @@ def show_colored_grid(grid, text=True):
         "orange",
         "teal",
         "maroon",
+        "white",
     ]
     color_8bit = {
         "black": 0,
@@ -1131,6 +1145,7 @@ def show_colored_grid(grid, text=True):
         "orange": 202,
         "teal": 6,
         "maroon": 196,
+        "white": 15,
     }
 
     for y in range(grid.shape[1]):

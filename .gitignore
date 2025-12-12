@@ -1,2 +1,8 @@
 # Ignore pycache stuff
 __pycache__/
+.ipynb_checkpoints/
+cache/
+cache_usage/
+lxy/log/
+lib/
+server.log
