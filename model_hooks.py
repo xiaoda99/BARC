@@ -98,9 +98,7 @@ def is_remote(model):
 def get_hidden_states(model, r, layer, pos_ids=None, **_):
     if is_remote(model):
         return model.get_hidden_states(sample_id=r.index, layer=layer, pos_ids=pos_ids)
-    hs = r.outputs.hidden_states[layer]
-    if pos_ids is not None: hs = hs[:, pos_ids]
-    return hs
+    return to_gpu(r.outputs.hidden_states[layer], model.device, pos_ids)
 
 
 def get_head_output(model, r, layer, head, pos_ids=None, **_):
@@ -153,7 +151,7 @@ def get_attn_weights(model, r, layer, head, pos_ids=None, use_cache=True, **_):
     outputs = r.outputs
     head_key = head if isinstance(head, (int, type(None))) else tuple(head)
     pos_key = tuple(pos_ids) if pos_ids is not None else None
-    cache_key = (layer, head_key, pos_key)
+    cache_key = (r.index, layer, head_key, pos_key)
     
     if use_cache and cache_key in _attn_weights_cache:
         return _attn_weights_cache[cache_key]

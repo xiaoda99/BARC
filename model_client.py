@@ -34,10 +34,11 @@ class ModelClient:
     for subsequent calls. You can override it by passing dataset_id explicitly.
     """
     
-    def __init__(self, base_url: str = "http://localhost:8000"):
+    def __init__(self, base_url: str = "http://localhost:8000", device: str = "cuda:0"):
         self.base_url = base_url.rstrip("/")
         self._config = None
         self.dataset_id = None  # Set by forward_results
+        self.device = device
     
     def _get_dataset_id(self, dataset_id: Optional[str]) -> str:
         """Get dataset_id, using stored value if not provided."""
@@ -213,7 +214,7 @@ class ModelClient:
     
     def _rpc(self, endpoint, **kw):
         """RPC helper: POST to endpoint, return tensor."""
-        device = kw.pop('device', 'cpu')
+        device = kw.pop('device', self.device)
         kw['dataset_id'] = self._get_dataset_id(kw.get('dataset_id'))
         # Convert tensor pos_ids to list for JSON serialization
         if 'pos_ids' in kw and hasattr(kw['pos_ids'], 'tolist'):
@@ -224,32 +225,6 @@ class ModelClient:
     def get_attn_weights(self, **kw): return self._rpc("/attn_weights", **kw)
     def get_head_output(self, **kw): return self._rpc("/head_output", **kw)
     def get_attn_output(self, **kw): return self._rpc("/attn_output", **kw)
-    
-    # =========================================================================
-    # Batch Operations
-    # =========================================================================
-    
-    def get_attn_weights_batch(
-        self,
-        sample_ids: List[int],
-        layer: int,
-        head: Optional[int] = None,
-        pos_ids: Optional[List[int]] = None,
-        device: str = 'cpu',
-        show_progress: bool = False,
-        dataset_id: Optional[str] = None,
-    ) -> torch.Tensor:
-        """Get attention weights for multiple samples, stacked."""
-        dataset_id = self._get_dataset_id(dataset_id)
-        iterator = sample_ids
-        if show_progress:
-            iterator = tqdm(sample_ids, desc=f"Getting attn L{layer}H{head}")
-        
-        tensors = [
-            self.get_attn_weights(sid, layer, head, pos_ids, device, dataset_id)
-            for sid in iterator
-        ]
-        return torch.cat(tensors, dim=0)
     
     # =========================================================================
     # Dataset Management
@@ -331,6 +306,51 @@ class ModelClient:
                 self._response_to_tensor(resp["first"], device),
                 self._response_to_tensor(resp["second"], device),
             )
+        return self._response_to_tensor(resp, device)
+    
+    def compute_node_forward(
+        self,
+        sample_id: int,
+        node_type: str,  # 'attn_q', 'attn_k', 'attn_v', 'mlp_i', 'mlp_g', 'lm_head'
+        layer: int,
+        pos_ids: List[int],
+        head: Optional[int] = None,
+        src_pos_ids: Optional[List[int]] = None,
+        upstream_sum: Optional[torch.Tensor] = None,
+        device: str = 'cpu',
+        dataset_id: Optional[str] = None,
+    ) -> torch.Tensor:
+        """
+        Compute forward output for a node.
+        
+        Args:
+            sample_id: Sample index
+            node_type: One of 'attn_q', 'attn_k', 'attn_v', 'mlp_i', 'mlp_g', 'lm_head'
+            layer: Layer index
+            pos_ids: Query position indices
+            head: Attention head index (required for attention nodes)
+            src_pos_ids: Source positions for k/v nodes
+            upstream_sum: Tensor to replace cached input (from upstream nodes)
+            device: Device for returned tensor
+            dataset_id: Dataset ID (uses stored value if None)
+        
+        Returns:
+            Output tensor
+        """
+        payload = {
+            "dataset_id": self._get_dataset_id(dataset_id),
+            "sample_id": sample_id,
+            "node_type": node_type,
+            "layer": layer,
+            "pos_ids": pos_ids,
+            "head": head,
+            "src_pos_ids": src_pos_ids,
+        }
+        
+        if upstream_sum is not None:
+            payload["upstream_sum"] = self._tensor_to_payload(upstream_sum)
+        
+        resp = self._post("/compute_node_forward", payload)
         return self._response_to_tensor(resp, device)
     
     def compute_node_gradient_batch(

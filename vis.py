@@ -8,7 +8,7 @@ from einops import rearrange
 
 from common_utils import join_lists, numpy, show_topk
 from model_hooks import get_head_output, get_attn_output, get_attn_weights
-from attribute import Node, attribute_attn_weights
+from attribute import attribute_attn_weights, get_ranges
 
 
 def get_ap_scores(aw, attn_labels, ranges_q):
@@ -43,22 +43,6 @@ def get_head_matching_scores(result, attn_patterns, model, layer, head):
         matching_scores[attn_pattern] = ap_scores
     return matching_scores if isinstance(attn_patterns, list) else list(matching_scores.values())[0]
 
-
-def get_ranges(example, span):
-    item_tokens = ['(', 'x', ',', 'y', '):', 'c', ',']
-    t2i = {t: i for i, t in enumerate(item_tokens)}
-    # span = restore_span(span)
-    if span.startswith('A'):  # ans
-        indices = [qa.answer.value_ranges['c'][0] for qa in example.output]
-    elif span.startswith('V'):  # val
-        indices = [example.input_ranges.grid[*qa.answer.key, t2i['c'], 0] for qa in example.output]
-    elif span.startswith('QV'):  # qval
-        indices = [qa.query.value_ranges['c'][0] for qa in example.output]
-    indices = torch.LongTensor(indices)
-    if span.endswith('-'): indices = indices - 1
-    elif span.endswith('+'): indices = indices + 1
-    ranges = [slice(i, i + 1) for i in indices] # TODO: assume all spans are of length 1
-    return ranges, indices  
 
 def attn_pattern2labels(examples, attn_pattern, tokens, normalize=True):
     seq_len = len(tokens)
@@ -183,8 +167,8 @@ def show_attn(r, model, layer, head, downstreams=None, last_k=1, start=None, sto
         for a, b in zip(answers, eval_head_lens(r, model, layer, head, reduce='none'))])
 
     tokens = [t.replace('Ġ', ' ').replace('Ċ', '\n') for t in model.tokenizer.tokenize(r.prompt)]
-    start = start or r.puzzle['train'][-last_k].input_ranges.prefix['grid'][0] - 5
-    stop = stop or len(tokens)
+    start = start if start is not None else r.puzzle['train'][-last_k].input_ranges.prefix['grid'][0] - 5
+    stop = stop if stop is not None else len(tokens)
     print(f'start={start}, stop={stop}')
     return tokens[start:stop], aw[0, :, start:stop].T, labels
 

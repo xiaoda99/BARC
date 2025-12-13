@@ -85,15 +85,11 @@ top_heads = [(62, 40), (62, 45), (63, 61)]  # Example heads
 
 aw = {}
 for layer, head in tqdm(top_heads, desc="Getting attn weights"):
-    # Get attention weights for all samples, stacked
-    aw[(layer, head)] = client.get_attn_weights_batch(
-        dataset_id,
-        sample_ids=list(range(len(_results))),
-        layer=layer,
-        head=head,
-        pos_ids=pos_ids,
-        device='cpu'
-    )
+    # Get attention weights for each sample
+    aw[(layer, head)] = torch.cat([
+        client.get_attn_weights(sample_id=sid, layer=layer, head=head, pos_ids=pos_ids)
+        for sid in range(len(_results))
+    ], dim=0)
 
 print(f"Attention shape: {list(aw.values())[0].shape}")
 

@@ -47,16 +47,16 @@ def scaled_input(input, num_points, baseline=None, requires_grad=True):
 
 
 def compute_loss(logits, labels, reduction=None, return_logit_diff=False, logits_mask=None):
-    if return_logit_diff:
-        b = (labels != -100).squeeze(0)  # 1i->i
-        _logits, _labels = logits[:, b], labels[:, b]  # biv->bkv, 1i->1k
-        _logits_mask = (logits_mask == 0)[:, b]  # biv->bkv
-        _logits_mean = (_logits * _logits_mask).sum(-1) / _logits_mask.sum(-1)  # bk = bkv->bk / bkv->bk
-        _logits = _logits - _logits_mean.unsqueeze(-1)  # bkv - bk->bk1 = bkv
-        # loss as the NEGATIVE of logit diff
-        assert reduction in [None, 'per_example_mean'], reduction
-        loss = -_logits[:, torch.arange(_logits.size(1)), _labels[0]].sum(-1)  # bkv->bk->b, per_example_mean
-        return loss
+    # if return_logit_diff:  
+    #     b = (labels != -100).squeeze(0)  # 1i->i
+    #     _logits, _labels = logits[:, b], labels[:, b]  # biv->bkv, 1i->1k
+    #     _logits_mask = (logits_mask == 0)[:, b]  # biv->bkv
+    #     _logits_mean = (_logits * _logits_mask).sum(-1) / _logits_mask.sum(-1)  # bk = bkv->bk / bkv->bk
+    #     _logits = _logits - _logits_mean.unsqueeze(-1)  # bkv - bk->bk1 = bkv
+    #     # loss as the NEGATIVE of logit diff
+    #     assert reduction in [None, 'per_example_mean'], reduction
+    #     loss = -_logits[:, torch.arange(_logits.size(1)), _labels[0]].sum(-1)  # bkv->bk->b, per_example_mean
+    #     return loss
 
     if reduction is None: reduction = 'per_example_mean'
     # print('in compute_loss, labels =', labels)
@@ -208,6 +208,27 @@ def get_lm_head_kwargs(r, model):
     return dict(labels=labels, logits_mask=logits_mask)
 
 
+def get_ranges(example, span):
+    item_tokens = ['(', 'x', ',', 'y', '):', 'c', ',']
+    t2i = {t: i for i, t in enumerate(item_tokens)}
+    # span = restore_span(span)
+    if span.startswith('A'):  # ans
+        indices = [qa.answer.value_ranges['c'][0] for qa in example.output]
+    elif span.startswith('V'):  # val
+        indices = [example.input_ranges.grid[*qa.answer.key, t2i['c'], 0] for qa in example.output]
+    elif span.startswith('QV'):  # qval
+        indices = [qa.query.value_ranges['c'][0] for qa in example.output]
+    indices = torch.LongTensor(indices)
+    if span.endswith('-'): indices = indices - 1
+    elif span.endswith('+'): indices = indices + 1
+    ranges = [slice(i, i + 1) for i in indices] # TODO: assume all spans are of length 1
+    return ranges, indices  
+
+
+def get_pos_ids_by_span(r, span, last_k=2):
+    return torch.cat([get_ranges(e, span)[1] for e in r.puzzle['train'][-last_k:]])
+
+
 class Graph(object):
     def __init__(self, dataset_size, hidden_size, set_current=True):
         self.nodes = []
@@ -218,7 +239,8 @@ class Graph(object):
             set_current_graph(self)  # Auto-set as current graph for Node interning
     
     def add_node(self, node):
-        node.graph = self  # TODO unnecessary
+        if node in self.nodes: return  # Prevent duplicates
+        node.graph = self  # TODO: unnecessary?
         node.dataset_size = self.dataset_size
         node.hidden_size = self.hidden_size
         self.nodes.append(node)
@@ -246,6 +268,65 @@ class Graph(object):
 
     def get_downstreams(self, node):
         return [downstream for (upstream, downstream), _ in self.edges.items() if upstream == node]
+
+    def get_upstreams(self, node):
+        return [upstream for (upstream, downstream), _ in self.edges.items() if downstream == node]
+    
+    def topological_sort(self):
+        """Sort nodes from leaves (no incoming edges) to root (lm_head).
+        Returns nodes in order such that all upstreams of a node come before it.
+        """
+        # Build in-degree map
+        in_degree = {node: 0 for node in self.nodes}
+        for (upstream, downstream), _ in self.edges.items():
+            if downstream in in_degree:
+                in_degree[downstream] += 1
+        
+        # Start with leaves (in_degree == 0)
+        queue = [n for n in self.nodes if in_degree[n] == 0]
+        sorted_nodes = []
+        
+        while queue:
+            node = queue.pop(0)
+            sorted_nodes.append(node)
+            for downstream in self.get_downstreams(node):
+                if downstream in in_degree:
+                    in_degree[downstream] -= 1
+                    if in_degree[downstream] == 0:
+                        queue.append(downstream)
+        
+        return sorted_nodes
+
+    def get_reachable(self, start_nodes):
+        """Get all nodes reachable downstream from start_nodes (BFS)."""
+        reachable = set(start_nodes)
+        queue = list(start_nodes)
+        while queue:
+            node = queue.pop(0)
+            for ds in self.get_downstreams(node):
+                if ds not in reachable:
+                    reachable.add(ds)
+                    queue.append(ds)
+        return reachable
+
+    def forward(self, r, model, leaf_nodes=None):
+        if leaf_nodes is None: # graph leaves - all nodes reachable
+            downstream_set = {ds for (_, ds) in self.edges.keys()}
+            leaf_nodes = [n for n in self.nodes if n not in downstream_set]
+            sorted_nodes = self.topological_sort()
+        else: # custom leaves - filter to reachable nodes only
+            reachable = self.get_reachable(leaf_nodes)
+            sorted_nodes = [n for n in self.topological_sort() if n in reachable]
+        
+        node_outputs = {}
+        for node in sorted_nodes:
+            upstream_outputs = [node_outputs[up] for up in self.get_upstreams(node) if up in node_outputs]
+            # Leaf nodes use cached hidden_states, others use upstream_sum
+            upstream_sum = None if node in leaf_nodes else (sum(upstream_outputs) if upstream_outputs else None)
+            output = node.forward(r, model, upstream_sum=upstream_sum)
+            if node.is_lm_head(): return output
+            node_outputs[node] = output
+        raise ValueError("No lm_head node found in graph")
 
 
 class Node(object):
@@ -320,13 +401,16 @@ class Node(object):
             self.span = downstream.src_span
         self.pos_ids = downstream.src_pos_ids
         if self.type in ['mlp', 'mlp_i', 'mlp_g', 'attn_q', 'attn_qns', 'attn_a']:
-            self.src_span == self.span
+            self.src_span = self.span
             self.src_pos_ids = self.pos_ids
         elif self.type == 'attn_v':
             dst, src = self.attn_pattern.split('->')
             if src == dst:
-                self.src_span == self.span
+                self.src_span = self.span
                 self.src_pos_ids = self.pos_ids
+            elif src in ['V', ]:  # TODO: add other spans
+                self.src_span = src
+                self.src_pos_ids = get_pos_ids_by_span(r, src)
             else:  # TODO
                 assert False
         else:  # TODO
@@ -340,7 +424,6 @@ class Node(object):
 
     def backward(self, r, model):
         """Unified backward - dispatches to local or remote based on model type.
-        
         Args:
             r: Result object with index and outputs
             model: Either a local nn.Module or a ModelClient instance
@@ -354,7 +437,6 @@ class Node(object):
         self.grad[r.index] = grad
     
     def _backward_local(self, r, model):
-        """Local backward using the model directly."""
         outputs = r.outputs
         residual = outputs.hidden_states[self.layer][:, self.pos_ids].to(model.device)
         if self.is_mlp(): residual += get_attn_output(model, r, self.layer, self.pos_ids)
@@ -404,7 +486,6 @@ class Node(object):
         return grad
 
     def _backward_remote(self, r, client):
-        """Remote backward via model server."""
         output_grad = self.output_grad[r.index] if self.output_grad is not None else None
         steps = 0 if self.is_attn() else None
         
@@ -428,43 +509,99 @@ class Node(object):
             return (grad[0].to(self.device), grad[1].to(self.device))
         return grad.to(self.device)
 
+    def forward(self, r, model, upstream_sum=None):
+        return self._forward_remote(r, model, upstream_sum) if is_remote(model) else self._forward_local(r, model, upstream_sum)
 
-def _attribute_residual(r, model, grads, pos_ids, downstream_layers, from_layer=0, to_layer=None):
+    def _forward_local(self, r, model, upstream_sum=None):
+        """Compute forward output for this node.
+        upstream_sum: Optional tensor to REPLACE residual input. Shape bke (bje for attn_k/v).
+        Returns: Output tensor bke
+        """
+        outputs = r.outputs
+        
+        if self.is_lm_head():
+            x = upstream_sum if upstream_sum is not None else outputs.hidden_states[-1].to(model.device)
+            return lm_head_forward(model, model.model.norm(x), **get_lm_head_kwargs(r, model))
+        
+        ln_name = 'input_layernorm' if not self.is_mlp() else 'post_attention_layernorm'
+        ln = getattr(model.model.layers[self.layer], ln_name)
+        
+        if self.is_mlp():
+            cached = get_hidden_states(model, r, self.layer, self.pos_ids) + \
+                     get_attn_output(model, r, self.layer, self.pos_ids)
+            xi = xg = ln(cached)
+            if upstream_sum is not None:
+                upstream_ln = ln(upstream_sum)
+                if self.type == 'mlp_i': xi = upstream_ln
+                elif self.type == 'mlp_g': xg = upstream_ln
+                else: xi = xg = upstream_ln  # mlp
+            return mlp_forward(model, self.layer, xi=xi, xg=xg)
+        
+        # Attention: For attn_i (i in q,k,v), only xi uses upstream_sum, others use cached
+        xk = xv = ln(outputs.hidden_states[self.layer].to(model.device))
+        xq = xk[:, self.pos_ids]
+        
+        if upstream_sum is not None:
+            upstream_ln = ln(upstream_sum)
+            if self.type == 'attn_k':
+                xk = xk.clone(); xk[:, self.src_pos_ids] = upstream_ln
+            elif self.type == 'attn_v':
+                xv = xv.clone(); xv[:, self.src_pos_ids] = upstream_ln
+            else:  # attn_q, attn_qns, attn_a
+                xq = upstream_ln
+
+        attn_kwargs = get_attn_kwargs(*xk.shape[:2], model.device, model.dtype, pos_ids=self.pos_ids)
+        aw = get_attn_weights(model, r, self.layer, self.head, self.pos_ids).to(model.device) if self.type == 'attn_a' else None
+        no_sink = (self.type == 'attn_qns')
+        return head_forward(model, self.layer, self.head, xq=xq, xk=xk, xv=xv, aw=aw, no_sink=no_sink, **attn_kwargs)
+
+    def _forward_remote(self, r, client, upstream_sum=None):
+        kwargs = dict(
+            sample_id=r.index,
+            node_type=self.type,
+            layer=self.layer,
+            pos_ids=self.pos_ids.tolist(),
+            upstream_sum=upstream_sum,
+        )
+        if self.is_attn():
+            kwargs['head'] = self.head
+            if self.type in ['attn_k', 'attn_v'] and self.src_pos_ids is not None:
+                kwargs['src_pos_ids'] = self.src_pos_ids.tolist()
+        
+        return client.compute_node_forward(**kwargs)
+
+def _attribute_residual(r, model, pos_ids, downstream_grads, downstream_layers, from_layer=0, to_layer=None):
     """Core residual attribution logic. Used by both local and server.
-    
     Args:
-        outputs: Cached model outputs
-        model: The model
-        grads: Stacked gradients tensor [g, i, e]
-        pos_ids: Position indices tensor
+        downstream_grads: Stacked gradients tensor [g, i, e]
         downstream_layers: List of layer indices (float for MLP: layer+0.5)
         from_layer: Start layer (inclusive)
         to_layer: End layer (exclusive)
     
     Returns:
-        Attribution tensor [num_layers, num_heads+1, num_grads]
+        Attribution tensor [num_layers, num_heads+1, num_downstream_grads]
     """
     if to_layer is None:
         to_layer = int(math.floor(max(downstream_layers)))
     
-    attn_attr = torch.stack([
-        einsum('ine,gie->ng', get_head_output(model, r, l, None, pos_ids)[0], grads)
+    head_attr = torch.stack([
+        einsum('ine,gie->ng', get_head_output(model, r, l, None, pos_ids)[0], downstream_grads)
         for l in range(from_layer, to_layer)])  # lng
     
     mlp_attr = torch.stack([
-        einsum('ie,gie->g', r.outputs.mlp_outputs[l][:, pos_ids].to(model.device)[0], grads)
+        einsum('ie,gie->g', r.outputs.mlp_outputs[l][:, pos_ids].to(model.device)[0], downstream_grads)
         for l in range(from_layer, to_layer)])  # lg
     
     # Layer masks (only attribute to layers before downstream node)
-    grad_l = torch.as_tensor(downstream_layers, device=attn_attr.device)
-    output_l = torch.arange(from_layer, to_layer, device=attn_attr.device)
+    grad_l = torch.as_tensor(downstream_layers, device=head_attr.device)
+    output_l = torch.arange(from_layer, to_layer, device=head_attr.device)
     mask_attn = output_l[:, None] < grad_l[None, :]  # e.g. output_l=4, grad_l=4.5 is OK
     mask_mlp = output_l[:, None] < grad_l[None, :].floor()
     
-    attn_attr = attn_attr * mask_attn.unsqueeze(1).to(attn_attr.dtype)
+    head_attr = head_attr * mask_attn.unsqueeze(1).to(head_attr.dtype)
     mlp_attr = mlp_attr * mask_mlp.to(mlp_attr.dtype)
     
-    return torch.cat([attn_attr, mlp_attr.unsqueeze(1)], dim=1)  # l(n+1)g
+    return torch.cat([head_attr, mlp_attr.unsqueeze(1)], dim=1)  # l(n+1)g
 
 
 def attribute_residual(r, model, nodes, from_layer=0, to_layer=None):
@@ -474,7 +611,6 @@ def attribute_residual(r, model, nodes, from_layer=0, to_layer=None):
     pos_ids = nodes[0].pos_ids
     
     if is_remote(model):
-        # Remote: call client.attribute_residual
         downstream_grads = [node.grad[r.index] for node in nodes]
         return model.attribute_residual(
             sample_id=r.index,
@@ -485,26 +621,11 @@ def attribute_residual(r, model, nodes, from_layer=0, to_layer=None):
             to_layer=to_layer,
         )
     
-    # Local: use core function
-    grads = torch.cat([node.grad[r.index] for node in nodes]).to(model.device)  # g*[1ie]->gie
-    return _attribute_residual(r, model, grads, pos_ids, downstream_layers, from_layer, to_layer)
-
-
-# Keep for backward compatibility (deprecated)
-# def rattribute_residual(index, nodes, client, dataset_id, from_layer=0, to_layer=None):
-#     """DEPRECATED: Use attribute_residual(r, client, nodes, ...) instead."""
-#     from types import SimpleNamespace
-#     r = SimpleNamespace(index=index)
-#     # Temporarily set dataset_id on client
-#     old_dataset_id = client.dataset_id
-#     client.dataset_id = dataset_id
-#     result = attribute_residual(r, client, nodes, from_layer, to_layer)
-#     client.dataset_id = old_dataset_id
-#     return result
+    downstream_grads = torch.cat([node.grad[r.index] for node in nodes]).to(model.device)  # g*[1ie]->gie
+    return _attribute_residual(r, model, pos_ids, downstream_grads, downstream_layers, from_layer, to_layer)
 
 
 def attribute_step(r, model, nodes):
-    """Attribution step - works with local model or remote client."""
     for node in nodes:
         node.set_pos_ids(r)
         node.accum_output_grad(r.index)
@@ -526,15 +647,13 @@ def attribute_attn_weights(r, model, layer, head, downstreams):
     node.set_pos_ids(r)
     node.accum_output_grad(r.index)
     node.graph.remove_node(node)  # remove temporal node and edges
-    return node.backward(r, model)
+    aw, ag = node.backward(r, model)
+    return aw, ag
 
 
 def get_attn_attrs_on_dataset(results, model, layer, head, downstreams, normalize=True):
-    # pos_ids = downstreams[0].src_pos_ids
-    # aw = torch.cat([get_attn_weights(model, r.outputs, layer, head, pos_ids).to('cpu') for r in results])
-    # aa = torch.cat([attribute_attn_weights(r, model, layer, head, downstreams).to('cpu') for r in results])
-    aw, aa = map(torch.cat, zip(*[attribute_attn_weights(r, model, layer, head, downstreams) for r in results]))
-    aa = aw * aa.abs()
+    aw, ag = map(torch.cat, zip(*[attribute_attn_weights(r, model, layer, head, downstreams) for r in results]))
+    aa = aw * ag.abs()
     if normalize: aa /= aa.sum(dim=-1, keepdim=True)
     return aw, aa
 
@@ -553,12 +672,15 @@ def get_top_heads(attr, k=30, H=None):
         for l, h in zip(*topk_md(attr, k=k)[:2]) if h < H)
 
 
-def add_tnode(results, model, nodes, parent=None):
+def add_tree_node(results, model, nodes, parent=None):
     d = AttrData(nodes=nodes)
     tnode = TNode(data2str(d), parent=parent); tnode.data = d
 
     d.attr = mr(attribute_step)(results, model, nodes)  # nodes -> attr
-    d.top_heads = get_top_heads(d.attr, k=30, H=model.config.num_heads)  # attr -> top_heads -> attn_attrs_ds
+    d.top_heads = get_top_heads(d.attr, k=30, H=model.config.num_attention_heads)  # attr -> top_heads -> attn_attrs_ds
     for l, h in d.top_heads:
         d.attn_weights_ds[(l, h)], d.attn_attrs_ds[(l, h)] = get_attn_attrs_on_dataset(results, model, l, h, nodes)
     return tnode
+
+
+add_tnode = add_tree_node

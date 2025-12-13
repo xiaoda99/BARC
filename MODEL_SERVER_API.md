@@ -177,43 +177,6 @@ attr = client.attribute_residual(
 
 ---
 
-## Batch Operations
-
-```python
-# Get attention weights for multiple samples
-attn_batch = client.get_attn_weights_batch(
-    dataset_id="data",
-    sample_ids=[0, 1, 2],
-    layer=60,
-    head=10,
-    pos_ids=[100],
-    show_progress=True,
-)
-# Returns: [num_samples, q_len, kv_len]
-
-# Compute gradients for multiple samples
-grads = client.compute_node_gradient_batch(
-    dataset_id="data",
-    sample_ids=[0, 1, 2],
-    node_type="attn_v",
-    layer=60,
-    head=10,
-    pos_ids=[100],
-    output_grads=[g0, g1, g2],  # Per-sample output gradients
-    show_progress=True,
-)
-# Returns: [num_samples, 1, pos_len, hidden_dim]
-
-# Or average over entire dataset
-avg_grad = client.compute_node_gradient(
-    dataset_id="data",
-    sample_id=None,  # Average over all cached samples
-    ...
-)
-```
-
----
-
 ## Integration with min_arc.py
 
 Remote versions of local functions for seamless server integration:

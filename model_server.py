@@ -91,6 +91,17 @@ class NodeGradientRequest(BaseModel):
     steps: Optional[int] = None  # IG steps: None=4, 0=plain backward
     # labels/candidate_ids removed - server gets from cached sample
 
+class NodeForwardRequest(BaseModel):
+    """Request for compute_node_forward endpoint."""
+    dataset_id: str
+    sample_id: int
+    node_type: str  # 'attn_q', 'attn_k', 'attn_v', 'mlp_i', 'mlp_g', 'lm_head'
+    layer: int
+    head: Optional[int] = None  # Required for attention nodes
+    pos_ids: List[int]
+    src_pos_ids: Optional[List[int]] = None  # For k/v nodes
+    upstream_sum: Optional["TensorResponse"] = None  # Replaces cached input
+
 class ResidualRequest(BaseModel):
     """Request for attribute_residual endpoint."""
     dataset_id: str
@@ -344,23 +355,16 @@ async def empty_cuda_cache():
 
 @app.post("/compute_node_gradient")
 async def compute_node_gradient(req: NodeGradientRequest):
-    """Compute IG gradient for a node. Averages over dataset if sample_id is None."""
+    """Compute IG gradient for a node."""
     if model is None:
         raise HTTPException(status_code=400, detail="No model loaded")
     if req.dataset_id not in datasets:
         raise HTTPException(status_code=404, detail=f"Dataset '{req.dataset_id}' not found")
     
     dataset = datasets[req.dataset_id]
-    
-    # Determine samples to process
-    if req.sample_id is not None:
-        if req.sample_id not in dataset:
-            raise HTTPException(status_code=404, detail=f"Sample {req.sample_id} not found")
-        sample_ids = [req.sample_id]
-    else:
-        sample_ids = list(dataset.keys())
-        if not sample_ids:
-            raise HTTPException(status_code=400, detail="Dataset is empty")
+    if req.sample_id not in dataset:
+        raise HTTPException(status_code=404, detail=f"Sample {req.sample_id} not found")
+    sample = dataset[req.sample_id]
     
     async with _lock:  # Prevent concurrent model access
         # Create a temporary Node (bypass __new__ interning and __init__)
@@ -373,40 +377,58 @@ async def compute_node_gradient(req: NodeGradientRequest):
         node.dataset_size = 1
         node.dtype = torch.float16
         node.device = 'cpu'
+        node.grad = None
+        node.output_grad = response_to_tensor(req.output_grad, model.device).unsqueeze(0) if req.output_grad else None
         
-        grads = []
-        for sample_id in sample_ids:
-            sample = dataset[sample_id]
-            
-            # Create Result-like object with required attributes
-            r = SimpleNamespace(
-                index=0,
-                outputs=sample["outputs"],
-                labels=sample.get("labels"),
-                candidate_ids=sample.get("candidate_ids"),
-                answer_indices=None,
-            )
-            
-            # Set up node for this sample
-            node.grad = None
-            if req.output_grad is not None:
-                output_grad = response_to_tensor(req.output_grad, model.device)
-                node.output_grad = output_grad.unsqueeze(0)
-            else:
-                node.output_grad = None
-            
-            grads.append(node._backward_local(r, model))
+        r = SimpleNamespace(
+            index=0,
+            outputs=sample["outputs"],
+            labels=sample.get("labels"),
+            candidate_ids=sample.get("candidate_ids"),
+            answer_indices=None,
+        )
         
-        if req.node_type == 'attn_a': # attn_a returns tuple (aw, grad), others return just grad
-            assert len(sample_ids) == 1, "attn_a only supports single sample"
-            assert isinstance(grads[0], tuple) and len(grads[0]) == 2
-            aw, grad = grads[0]
-            return TensorPairResponse(
-                first=tensor_to_response(aw),
-                second=tensor_to_response(grad),
-            )
-        avg_grad = torch.stack(grads).mean(dim=0) if len(grads) > 1 else grads[0]
-        return tensor_to_response(avg_grad)
+        grad = node._backward_local(r, model)
+        
+        if req.node_type == 'attn_a':  # attn_a returns tuple (aw, grad)
+            assert isinstance(grad, tuple) and len(grad) == 2
+            return TensorPairResponse(first=tensor_to_response(grad[0]), second=tensor_to_response(grad[1]))
+        return tensor_to_response(grad)
+
+@app.post("/compute_node_forward")
+async def compute_node_forward(req: NodeForwardRequest):
+    """Compute forward output for a node."""
+    if model is None:
+        raise HTTPException(status_code=400, detail="No model loaded")
+    if req.dataset_id not in datasets:
+        raise HTTPException(status_code=404, detail=f"Dataset '{req.dataset_id}' not found")
+    
+    dataset = datasets[req.dataset_id]
+    if req.sample_id not in dataset:
+        raise HTTPException(status_code=404, detail=f"Sample {req.sample_id} not found")
+    
+    async with _lock:  # Prevent concurrent model access
+        sample_cache = dataset[req.sample_id]
+        
+        # Create a temporary Node (bypass __new__ interning and __init__)
+        node = object.__new__(Node)
+        node.layer = req.layer
+        node.head = req.head
+        node.type = req.node_type
+        node.pos_ids = torch.LongTensor(req.pos_ids)
+        node.src_pos_ids = torch.LongTensor(req.src_pos_ids) if req.src_pos_ids else node.pos_ids
+        
+        r = SimpleNamespace(
+            index=0,
+            outputs=sample_cache["outputs"],
+            labels=sample_cache.get("labels"),
+            candidate_ids=sample_cache.get("candidate_ids"),
+            answer_indices=None,
+        )
+        
+        upstream_sum = response_to_tensor(req.upstream_sum, model.device) if req.upstream_sum is not None else None
+        output = node._forward_local(r, model, upstream_sum=upstream_sum)
+        return tensor_to_response(output)
 
 @app.post("/attribute_residual")
 async def attribute_residual(req: ResidualRequest):
