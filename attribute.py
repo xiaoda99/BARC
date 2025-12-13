@@ -452,7 +452,7 @@ class Node(object):
             if self.is_attn():
                 xkv = ln(outputs.hidden_states[self.layer].to(model.device))
                 if self.type == 'attn_a':
-                    aw = get_attn_weights(model, r, self.layer, self.head, self.pos_ids).to(model.device)
+                    aw = get_attn_weights(model, r, self.layer, self.head, self.pos_ids)#.to(model.device) # TODO: remove comment
 
         if self.type == 'lm_head':
             fwd_fn, kwarg = partial(lm_head_forward, model, **get_lm_head_kwargs(r, model)), dict(hidden_states=x)

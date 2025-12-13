@@ -155,7 +155,7 @@ def show_attn(r, model, layer, head, downstreams=None, last_k=1, start=None, sto
     pos_ids = torch.LongTensor(r.answer_indices[-r.Q_train*last_k:]) - 1
     aw = aw[:, pos_ids]  # 1ij-1kj
     if downstreams is not None:
-        ag = attribute_attn_weights(r, model, layer, head, downstreams)[1].to('cpu')
+        ag = attribute_attn_weights(r, model, layer, head, downstreams)[1].to(aw.device)
         ag = ag[:, -len(pos_ids):]
         aa = aw * ag.abs()
         aa = aa / aa.sum(-1, keepdim=True)

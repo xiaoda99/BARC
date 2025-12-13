@@ -6,6 +6,11 @@ import einops
 from einops import rearrange
 
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+from graph_registry import (
+    get_attn_weights_cache, 
+    clear_attn_weights_cache, 
+    get_attn_weights_cache_info
+)
 
 
 @dataclass
@@ -142,8 +147,6 @@ def get_attn_kwargs(batch_size, seq_length, device, dtype, pos_ids=None):
     return {'attention_mask': attention_mask, 'position_ids': position_ids, 'q_position_ids': q_position_ids}
 
 
-_attn_weights_cache = {} # Cache for get_attn_weights results (avoids SDPA non-determinism)
-
 def get_attn_weights(model, r, layer, head, pos_ids=None, use_cache=True, **_):
     if is_remote(model):
         return model.get_attn_weights(sample_id=r.index, layer=layer, head=head, pos_ids=pos_ids)
@@ -153,8 +156,9 @@ def get_attn_weights(model, r, layer, head, pos_ids=None, use_cache=True, **_):
     pos_key = tuple(pos_ids) if pos_ids is not None else None
     cache_key = (r.index, layer, head_key, pos_key)
     
-    if use_cache and cache_key in _attn_weights_cache:
-        return _attn_weights_cache[cache_key]
+    cache = get_attn_weights_cache()  # From graph_registry (survives autoreload)
+    if use_cache and cache_key in cache:
+        return cache[cache_key].to(model.device)  # TODO: remove to(), slice already in gpu
     
     self = model.model.layers[layer]
     hidden_states = to_gpu(outputs.hidden_states[layer], model.device)
@@ -164,25 +168,9 @@ def get_attn_weights(model, r, layer, head, pos_ids=None, use_cache=True, **_):
     kwargs = get_attn_kwargs(hidden_states.shape[0], hidden_states.shape[1], model.device, model.dtype, pos_ids=pos_ids)
     if head is None: head = list(range(model.config.num_attention_heads))
     result = self.self_attn(hidden_states=hidden_states, q_hidden_states=q_hidden_states, 
-                            output_attentions=True, **kwargs)[1][:, head].to('cpu')
+                            output_attentions=True, **kwargs)[1][:, head]#.to('cpu') # TODO: remove comment
     
-    if use_cache:
-        _attn_weights_cache[cache_key] = result
+    if use_cache and pos_ids is not None:  # only cache slice in gpu mem
+        cache[cache_key] = result
     return result
-
-
-def clear_attn_weights_cache():
-    """Clear the attention weights cache."""
-    global _attn_weights_cache
-    _attn_weights_cache.clear()
-
-
-def get_attn_weights_cache_info():
-    """Return cache statistics."""
-    total_bytes = sum(t.numel() * t.element_size() for t in _attn_weights_cache.values())
-    return {
-        'entries': len(_attn_weights_cache),
-        'memory_mb': total_bytes / (1024 * 1024),
-        'keys': list(_attn_weights_cache.keys())
-    }
 
