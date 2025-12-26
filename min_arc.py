@@ -610,7 +610,7 @@ def verbalize_puzzle(puzzle, style='dict', color_quote='', tokenizer=None, base=
     return tsb.str, n_tokens, puzzle
 
 
-def gen_prompt(puzzle, fn_defs=None, tokenizer=None, print_out=True, **kwargs): # style='dict', color_quote=''
+def gen_prompt(puzzle, fn_defs=None, tokenizer=None, print_out=True, remove_instructions=False, **kwargs): # style='dict', color_quote=''
     apply_chat_template = partial(tokenizer.apply_chat_template, tokenize=False, add_generation_prompt=True)
     dummy_content = 'dummy_content'
     messages = [ # official: "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
@@ -625,7 +625,8 @@ def gen_prompt(puzzle, fn_defs=None, tokenizer=None, print_out=True, **kwargs): 
     grid_str, n_tokens, _, _ = verbalize_grid(example_grid, color_names,
         tokenizer=tokenizer, base=tsb.base, print_out=False, **kwargs)
     print(grid_str, end='', n_tokens=n_tokens)
-    print(instructions.format(fn_defs=fn_defs))
+    if not remove_instructions: 
+        print(instructions.format(fn_defs=fn_defs))
     print(f'# **{system_prompt3}**\n')
     
     puzzle_str, n_tokens, puzzle = verbalize_puzzle(puzzle, 

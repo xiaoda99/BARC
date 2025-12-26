@@ -218,7 +218,11 @@ def get_ranges(example, span):
         indices = [example.input_ranges.grid[*qa.answer.key, t2i['c'], 0] for qa in example.output]
     elif span.startswith('QV'):  # qval
         indices = [qa.query.value_ranges['c'][0] for qa in example.output]
+    elif span.startswith('Qy'):  # qval
+        indices = [qa.query.value_ranges['c'][0]-2 for qa in example.output]
     indices = torch.LongTensor(indices)
+    if span.endswith('^'):
+        indices[1:] = indices[:-1].clone()
     if span.endswith('-'): indices = indices - 1
     elif span.endswith('+'): indices = indices + 1
     ranges = [slice(i, i + 1) for i in indices] # TODO: assume all spans are of length 1
@@ -239,7 +243,8 @@ class Graph(object):
             set_current_graph(self)  # Auto-set as current graph for Node interning
     
     def add_node(self, node):
-        if node in self.nodes: return  # Prevent duplicates
+        if node in self.nodes:   # Prevent duplicates
+            print(f'{node} already in graph!'); return
         node.graph = self  # TODO: unnecessary?
         node.dataset_size = self.dataset_size
         node.hidden_size = self.hidden_size
@@ -250,13 +255,9 @@ class Graph(object):
         for upstream, downstream in list(self.edges.keys()):
             assert downstream != node, f'Can not remove the downstream node of edge {upstream}->{downstream}.'
             if upstream == node: del self.edges[(upstream, downstream)]
-        # node.graph = None
 
     def add_edge(self, upstream, downstream, score):
-        if upstream not in self.nodes:
-            self.add_node(upstream)  # attn_a nodes are temporal
-        else:
-            assert upstream.graph == self, f'dangling {upstream} w/o graph? {upstream.graph is None}'
+        if upstream not in self.nodes: self.add_node(upstream)
         assert downstream in self.nodes, f'{downstream} not in graph'
         self.edges[(upstream, downstream)] = score
         # Freeze nodes to prevent modification of hash-relevant attributes
@@ -338,6 +339,7 @@ class Node(object):
         if g is not None:
             for node in g.nodes:
                 if node.layer == layer and node.head == head and node.type == type:
+                    print(f'{node} already in graph!')
                     return node  # Return existing node
         return super().__new__(cls)
     
@@ -408,7 +410,7 @@ class Node(object):
             if src == dst:
                 self.src_span = self.span
                 self.src_pos_ids = self.pos_ids
-            elif src in ['V', ]:  # TODO: add other spans
+            elif src in ['V', 'A^']:  # TODO: add other spans
                 self.src_span = src
                 self.src_pos_ids = get_pos_ids_by_span(r, src)
             else:  # TODO
@@ -683,4 +685,4 @@ def add_tree_node(results, model, nodes, parent=None):
     return tnode
 
 
-add_tnode = add_tree_node
+add_tnode = add_tree_node  # TODO: rename function in notebook

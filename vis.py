@@ -25,11 +25,12 @@ def get_ap_scores(aw, attn_labels, ranges_q):
     return scores#, scores.mean(-1)  # ...k->..., e.g. lnk->ln
 
 
-def get_head_matching_scores(result, attn_patterns, model, layer, head):
+def get_head_matching_scores(result, attn_patterns, model, layer, head, last_k=2):
     is_mlp = head == model.config.num_attention_heads
     _attn_patterns = attn_patterns if isinstance(attn_patterns, list) else [attn_patterns]
     tokens = [t.replace('Ġ', ' ').replace('Ċ', '\n') for t in model.tokenizer.tokenize(result.prompt)]
-    pos_ids = torch.LongTensor(result.answer_indices) - 1
+    # pos_ids = torch.LongTensor(result.answer_indices) - 1
+    pos_ids = None
     if not is_mlp: attn_weights = get_attn_weights(model, result, layer, head, pos_ids=pos_ids)
     matching_scores = {}
     for attn_pattern in _attn_patterns:
@@ -37,7 +38,7 @@ def get_head_matching_scores(result, attn_patterns, model, layer, head):
             dst, src = attn_pattern.split('->')
             matching_scores[attn_pattern] = torch.tensor(float(src == dst))  # == 1.
             continue
-        attn_labels, ranges_q = attn_pattern2labels(result.puzzle['train'][-2:], attn_pattern, tokens)
+        attn_labels, ranges_q = attn_pattern2labels(result.puzzle['train'][-last_k:], attn_pattern, tokens)
         if pos_ids is not None: attn_labels = attn_labels[pos_ids, :]  # [q_seq_len[pos_ids], kv_seq_len]
         ap_scores = get_ap_scores(attn_weights, attn_labels.to(attn_weights.device), ranges_q)
         matching_scores[attn_pattern] = ap_scores
@@ -255,6 +256,11 @@ def compute_js_matrix(aw_dict: Dict[Tuple[int, int], torch.Tensor]) -> Tuple[np.
             js_matrix[i, j] = js_val
             js_matrix[j, i] = js_val  # Mirror for symmetry
     
+    # Ensure symmetry even with NaN (NaN != NaN breaks scipy's symmetry check)
+    # js_matrix = np.nan_to_num(js_matrix, nan=0.0)
+    # js_matrix = (js_matrix + js_matrix.T) / 2
+    # np.fill_diagonal(js_matrix, 0)
+    
     return js_matrix, head_keys
 
 
@@ -326,7 +332,7 @@ def cluster_heads(
     # Compute distance matrix
     dist_matrix, head_keys = dist_fn(data_dict)
     head_labels = [f'{layer}-{head}' for layer, head in head_keys]
-    
+    # print(dist_matrix.shape, head_keys, dist_matrix)
     # Hierarchical clustering
     dist_condensed = squareform(dist_matrix)
     linkage_matrix = linkage(dist_condensed, method=method)

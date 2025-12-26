@@ -1,7 +1,9 @@
 """Common library for ARC"""
 
+import math
 import numpy as np
 import random
+import matplotlib.pyplot as plt
 
 
 class Color:
@@ -30,6 +32,7 @@ class Color:
     TEAL = 8
     MAROON = 9
     WHITE = 10
+    PAD = 11
     TRANSPARENT = 0 # sometimes the language model likes to pretend that there is something called transparent/background, and black is a reasonable default
     BACKGROUND = 0
 
@@ -1065,12 +1068,19 @@ def _score_symmetry(grid, symmetry, ignore_colors, background=None):
 
     return perfect_mapping, off_canvas, bad_mapping
 
-def show_colored_grid(grid, text=True, show_tick_labels=False, ax=None):
+def show_colored_grid(grid, text=True, show_tick_labels=False, ax=None,
+                      cells=None, labels=None, markers=None):
     """
-    internal function not used by LLM
-    Not used by the language model, used by the rest of the code for debugging
+    Display a colored grid with optional cell markers/labels.
 
-    ax: optional Matplotlib Axes. If provided, draw into this axes without creating/showing a new figure.
+    Args:
+        grid: numpy array to display
+        text: if False, use matplotlib; if True, use terminal colors
+        show_tick_labels: show axis tick labels
+        ax: matplotlib Axes (if provided, draws into it without creating/showing figure)
+        cells: list of Cell objects or Pos/tuples to mark
+        labels: list of labels, single label for all, or None
+        markers: marker style ('x', 'o', etc.) or dict {cell: style}
     """
 
     if not text:
@@ -1117,9 +1127,14 @@ def show_colored_grid(grid, text=True, show_tick_labels=False, ax=None):
         plot_handle.grid()
         plot_handle.set_aspect(1)
         plot_handle.invert_yaxis()
+        
+        # Add markers/labels if specified
+        if cells is not None:
+            add_cell_markers(plot_handle, cells, labels, markers)
+        
         if ax is None:
             plt.show()
-        return
+        return plot_handle
 
     color_names = [
         "black",
@@ -1154,6 +1169,136 @@ def show_colored_grid(grid, text=True, show_tick_labels=False, ax=None):
             color_code = color_8bit[color_names[cell]]
             print(f"\033[38;5;{color_code}m{cell}\033[0m", end="")
         print()
+
+def add_cell_markers(ax, cells, labels=None, markers=None, offset=(0, 0), marker_scale=0.6):
+    """
+    Add markers/labels to cells on an existing axes.
+    
+    Args:
+        ax: matplotlib axes
+        cells: list of Cell objects or Pos/tuples
+        labels: list of labels, single label for all, or None (indices if no markers, else none)
+        markers: marker style ('x', 'o', etc.) or dict {cell: style}
+        offset: (row_offset, col_offset) to shift positions (for combined grids)
+        marker_scale: marker size as fraction of cell size (default 0.6 = 60%)
+    """
+    import matplotlib.patheffects as patheffects
+    
+    if cells is None or len(cells) == 0:
+        return
+    
+    # Calculate adaptive marker size based on cell size in points
+    fig = ax.get_figure()
+    fig.canvas.draw()  # Ensure layout is computed
+    bbox = ax.get_window_extent()
+    xlim, ylim = ax.get_xlim(), ax.get_ylim()
+    cells_x = abs(xlim[1] - xlim[0])
+    cell_size_pts = (bbox.width / cells_x) * 72 / fig.dpi  # convert to points
+    markersize = cell_size_pts * marker_scale
+    markeredgewidth = max(0.5, markersize / 5)
+    fontsize = max(4, markersize * 0.8)
+    
+    # Normalize labels
+    if labels is None:
+        labels = [''] * len(cells) if markers else [str(i) for i in range(len(cells))]
+    elif isinstance(labels, str):
+        labels = [labels] * len(cells)
+    
+    row_off, col_off = offset
+    
+    for i, cell in enumerate(cells):
+        x, y = cell.pos if hasattr(cell, 'pos') else cell
+        # Plot coords: cell (x,y) -> plot (y + col_off + 0.5, x + row_off + 0.5)
+        px, py = (y + col_off) + 0.5, (x + row_off) + 0.5
+        
+        if markers:
+            m = markers.get(cell, markers) if isinstance(markers, dict) else markers
+            ax.plot(px, py, m, markersize=markersize, color='white', markeredgewidth=markeredgewidth)
+        
+        if labels[i]:
+            ax.text(px, py, labels[i], ha='center', va='center',
+                    fontsize=fontsize, color='white', fontweight='bold',
+                    path_effects=[patheffects.withStroke(linewidth=max(1, markeredgewidth), foreground='black')])
+
+def concat_side_by_side(a, b, sep=1, fill=Color.WHITE):
+    h = max(a.shape[0], b.shape[0])
+    def pad_to_h(x):
+        pad_h = h - x.shape[0]
+        if pad_h > 0:
+            return np.vstack([x, np.full((pad_h, x.shape[1]), fill, dtype=x.dtype)])
+        return x
+    a_pad = pad_to_h(a)
+    b_pad = pad_to_h(b)
+    spacer = np.full((h, sep), fill, dtype=a_pad.dtype)
+    return np.concatenate([a_pad, spacer, b_pad], axis=1)
+
+def show_colored_grid_combined(example, ax=None,
+                                input_cells=None, input_labels=None, input_markers=None,
+                                output_cells=None, output_labels=None, output_markers=None,
+                                sep=1, show=True):
+    """
+    Show input and output grids side by side with optional markers/labels.
+    
+    Args:
+        example: Example object with .input and .output Grid attributes
+        ax: matplotlib axes (optional)
+        input_cells/labels/markers: markers for input grid
+        output_cells/labels/markers: markers for output grid  
+        sep: separator width between grids
+        show: whether to call plt.show()
+    """
+    
+    combined = concat_side_by_side(example.input.array, example.output.array, sep=sep)
+    combined = np.array(combined)
+    
+    created_fig = ax is None
+    if created_fig:
+        fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Show the combined grid (without markers yet, ax provided so no auto-show)
+    show_colored_grid(combined.T, text=False, ax=ax)
+    
+    # Add input markers (no offset)
+    if input_cells is not None:
+        add_cell_markers(ax, input_cells, input_labels, input_markers, offset=(0, 0))
+    
+    # Add output markers (offset by input width + separator)
+    if output_cells is not None:
+        output_offset = (0, example.input.array.shape[1] + sep)
+        add_cell_markers(ax, output_cells, output_labels, output_markers, offset=output_offset)
+    
+    if created_fig and show:
+        plt.show()
+    return ax
+
+def getdelattr(obj, attr):
+    if not hasattr(obj, attr): return None
+    r = getattr(obj, attr); delattr(obj, attr)
+    return r
+
+def show_examples(examples, height=2.0, input_markers='x', output_markers='x'):
+    """Show examples in a single row with width auto-adjusted per subplot's aspect ratio."""
+    def get_aspect(e):
+        w = e.input.array.shape[1] + e.output.array.shape[1] + 1  # +1 for separator
+        h = max(e.input.array.shape[0], e.output.array.shape[0])
+        return w / h
+    
+    aspects = [get_aspect(e) for e in examples]
+    
+    fig, axes = plt.subplots(1, len(examples),
+                              figsize=(height * sum(aspects), height),
+                              gridspec_kw={'width_ratios': aspects},
+                              constrained_layout=True)
+    if len(examples) == 1:
+        axes = [axes]
+    
+    for ax, e in zip(axes, examples):
+        show_colored_grid_combined(e, ax=ax,
+            input_cells=getdelattr(e.input, 'labeled_cells'), 
+            output_cells=getdelattr(e.output, 'labeled_cells'),
+            input_markers=input_markers, output_markers=output_markers)
+    
+    plt.show()
 
 
 def visualize(input_generator, transform, n_examples=5, n_attempts=100):
